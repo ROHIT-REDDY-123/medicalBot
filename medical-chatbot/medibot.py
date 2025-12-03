@@ -8,7 +8,7 @@ import time
 load_dotenv()
 
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_classic.chains import RetrievalQA
+from langchain.chains import RetrievalQA
 
 from langchain_core.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
