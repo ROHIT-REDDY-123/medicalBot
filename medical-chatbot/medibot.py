@@ -1,140 +1,241 @@
 
+"""
+Streamlit MediBot (Resume PDF specific)
+- Accepts only PDF uploads (saved to ./data)
+- Processes PDFs -> chunks -> embeddings -> FAISS DB saved to vectorstore/db_faiss
+- Serves a QA UI that answers only from the resume content
+"""
+
 import os
-import streamlit as st
-from dotenv import load_dotenv
 import time
+from pathlib import Path
+from typing import List
 
-# Load environment variables
-load_dotenv()
+import streamlit as st
+from pypdf import PdfReader
 
+# LangChain & embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.chains import RetrievalQA
-
-from langchain_core.prompts import PromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_ollama import OllamaLLM  # ✅ FIXED: Ollama instead of broken HF
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain_classic.chains import RetrievalQA
 
-DB_FAISS_PATH = "vectorstore/db_faiss"
+# Optional: local Ollama LLM - used as default if available
+try:
+    from langchain_ollama import OllamaLLM
+    OLLAMA_AVAILABLE = True
+except Exception:
+    OLLAMA_AVAILABLE = False
 
-@st.cache_resource
-def get_vectorstore():
-    embedding_model = HuggingFaceEmbeddings(
-        model_name='sentence-transformers/all-MiniLM-L6-v2',
-        model_kwargs={'device': 'cpu'}
-    )
-    db = FAISS.load_local(
-        DB_FAISS_PATH, 
-        embedding_model, 
-        allow_dangerous_deserialization=True
-    )
+# -----------------------
+# Config
+# -----------------------
+DATA_DIR = Path("data")
+DB_FAISS_PATH = Path("vectorstore/db_faiss")
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 150
+K = 3
+
+# Resume-specific prompt — concise and on-source only
+CUSTOM_PROMPT_TEMPLATE = """
+You are ResumeAssistant. Use ONLY the provided resume context to answer the question.
+If the answer is not present in the resume, reply: "I don't have that information in the resume."
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer (concise):
+"""
+
+PROMPT = PromptTemplate(template=CUSTOM_PROMPT_TEMPLATE, input_variables=["context", "question"])
+
+# -----------------------
+# Helpers: File & PDF handling
+# -----------------------
+def ensure_dirs():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DB_FAISS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def save_pdf_to_data(uploaded_file) -> Path:
+    """
+    Save uploaded PDF file (streamlit UploadedFile) to ./data and return path
+    Only accepts .pdf
+    """
+    ensure_dirs()
+    fname = uploaded_file.name
+    if not fname.lower().endswith(".pdf"):
+        raise ValueError("Only PDF files are accepted.")
+    dest = DATA_DIR / fname
+    # Overwrite if exists
+    with open(dest, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return dest
+
+def extract_text_from_pdf(pdf_path: Path) -> List[str]:
+    """
+    Return a list of page texts for given PDF path.
+    """
+    reader = PdfReader(str(pdf_path))
+    pages = []
+    for p in reader.pages:
+        pages.append(p.extract_text() or "")
+    return pages
+
+# -----------------------
+# Helpers: Chunking & Vectorstore
+# -----------------------
+def docs_from_pdf(pdf_path: Path) -> List[Document]:
+    """
+    Read PDF and return list[Document] with metadata: source, page, chunk
+    """
+    pages = extract_text_from_pdf(pdf_path)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    docs: List[Document] = []
+    chunk_index = 0
+    for page_idx, page_text in enumerate(pages, start=1):
+        if not page_text or page_text.strip() == "":
+            continue
+        chunks = splitter.split_text(page_text)
+        for c in chunks:
+            docs.append(Document(page_content=c, metadata={"source": pdf_path.name, "page": page_idx, "chunk": chunk_index}))
+            chunk_index += 1
+    return docs
+
+def build_faiss_from_pdfs(pdf_paths: List[Path]):
+    """
+    Given one or more PDF file paths, build embeddings and a FAISS DB and save locally.
+    Overwrites existing DB at DB_FAISS_PATH.
+    """
+    if not pdf_paths:
+        raise ValueError("No PDF paths provided for building FAISS.")
+    all_docs: List[Document] = []
+    for p in pdf_paths:
+        all_docs.extend(docs_from_pdf(p))
+    if not all_docs:
+        raise RuntimeError("No text extracted from provided PDFs.")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    db = FAISS.from_documents(all_docs, embeddings)
+    db.save_local(str(DB_FAISS_PATH))
     return db
 
-def set_custom_prompt(custom_prompt_template):
-    prompt = PromptTemplate(
-        template=custom_prompt_template, 
-        input_variables=["context", "question"]
-    )
-    return prompt
+def load_vectorstore() -> FAISS:
+    """
+    Load existing FAISS DB if present, otherwise raise.
+    """
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    if DB_FAISS_PATH.exists() and any(DB_FAISS_PATH.iterdir()):
+        db = FAISS.load_local(str(DB_FAISS_PATH), embeddings, allow_dangerous_deserialization=True)
+        return db
+    raise FileNotFoundError("FAISS DB not found. Upload PDF and build index first.")
 
-def load_llm():
-    """Load Ollama LLM (LOCAL - FAST - RELIABLE)"""
+# -----------------------
+# QA Chain
+# -----------------------
+def create_qa_chain(llm, db: FAISS):
+    """
+    Create a RetrievalQA chain using the provided LLM and vectorstore db.
+    """
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=db.as_retriever(search_kwargs={"k": K}),
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": PROMPT},
+    )
+
+def get_default_llm():
+    """
+    Return a default LLM. Preference: Ollama local if available; otherwise raise and ask user to configure.
+    """
+    if OLLAMA_AVAILABLE:
+        return OllamaLLM(model=os.getenv("OLLAMA_MODEL", "phi3:mini"), temperature=0.1, num_predict=200)
+    raise RuntimeError("No local LLM available. Install or run Ollama, or change get_default_llm to use HF/inference client.")
+
+# -----------------------
+# Streamlit UI
+# -----------------------
+def main():
+    st.set_page_config(page_title="MediBot — Resume QA (PDF only)", layout="centered")
+    st.title("🏥 MediBot — Resume PDF Q&A")
+    st.write("Upload a resume PDF. The app will index it and let you ask questions (answers come from the resume only).")
+
+    ensure_dirs()
+
+    # Left: upload & build; Right: chat
+    uploaded = st.file_uploader("Upload resume (PDF only)", type=["pdf"], accept_multiple_files=False)
+    if uploaded:
+        try:
+            saved_path = save_pdf_to_data(uploaded)
+            st.success(f"Saved to data/{saved_path.name}")
+            with st.spinner("Processing PDF and building index (this may take a few seconds)..."):
+                db = build_faiss_from_pdfs([saved_path])
+            st.success("Index built and saved to vectorstore/db_faiss")
+        except Exception as e:
+            st.error(f"Failed to process upload: {e}")
+            st.stop()
+
+    # Try to load DB (if exists)
     try:
-        llm = OllamaLLM(
-            model="phi3:mini",  # ✅ ollama pull phi3:mini
-            temperature=0.1,
-            num_predict=200
-        )
-        st.success("✅ Ollama LLM loaded!")
-        return llm
+        db = load_vectorstore()
+    except FileNotFoundError:
+        st.info("No index found — upload a PDF to build one.")
+        st.stop()
     except Exception as e:
-        st.error(f"❌ Ollama error: {e}")
-        st.info("💡 Run: `ollama serve` and `ollama pull phi3:mini`")
+        st.error(f"Error loading vectorstore: {e}")
         st.stop()
 
-def main():
-    st.set_page_config(page_title="MediBot", page_icon="🏥")
-    st.title("🏥 **MediBot** - Medical Assistant")
-    st.markdown("---")
+    # LLM
+    try:
+        llm = get_default_llm()
+        st.info("Using local Ollama LLM")
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-
-    if 'messages' not in st.session_state:
+    # chat state
+    if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message['role']):
-            st.markdown(message['content'])
+    # show chat history
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-    # Chat input
-    if prompt := st.chat_input("Ask a medical question..."):
-        # Add user message
-        st.chat_message('user').markdown(prompt)
-        st.session_state.messages.append({'role': 'user', 'content': prompt})
+    # input
+    if prompt_text := st.chat_input("Ask a question about the resume..."):
+        st.chat_message("user").markdown(prompt_text)
+        st.session_state.messages.append({"role": "user", "content": prompt_text})
 
-        with st.chat_message('assistant'):
-            with st.spinner("🔍 Searching medical database..."):
+        with st.chat_message("assistant"):
+            with st.spinner("Searching resume and generating answer..."):
                 try:
-                    # Load vectorstore
-                    vectorstore = get_vectorstore()
-                    
-                    # Load LLM (Ollama primary, Groq fallback)
-                    llm = load_llm()
-                    
-                    # Custom medical prompt
-                    CUSTOM_PROMPT_TEMPLATE = """
-                    You are a medical assistant. Answer using ONLY the provided medical context.
-                    If the answer is not found in context, say: "I don't have that medical information."
+                    qa_chain = create_qa_chain(llm, db)
+                    # invoke chain (invoke preferred; .run fallback)
+                    try:
+                        resp = qa_chain.invoke({"query": prompt_text})
+                        answer = resp.get("result") or resp.get("answer") or str(resp)
+                        source_docs = resp.get("source_documents", [])
+                    except Exception:
+                        answer = qa_chain.run(prompt_text)
+                        source_docs = []
 
-                    MEDICAL CONTEXT: {context}
+                    # format sources snippet
+                    src_info = ""
+                    for i, d in enumerate(source_docs[:3], 1):
+                        meta = d.metadata
+                        src_info += f"{i}. {meta.get('source')} (page {meta.get('page')}, chunk {meta.get('chunk')})\n"
 
-                    PATIENT QUESTION: {question}
-
-                    MEDICAL RESPONSE:"""
-
-                    # Create QA chain
-                    qa_chain = RetrievalQA.from_chain_type(
-                        llm=llm,
-                        chain_type="stuff",
-                        retriever=vectorstore.as_retriever(search_kwargs={'k': 3}),
-                        return_source_documents=True,
-                        chain_type_kwargs={'prompt': set_custom_prompt(CUSTOM_PROMPT_TEMPLATE)}
-                    )
-
-                    # Get response
-                    start_time = time.time()
-                    response = qa_chain.invoke({'query': prompt})
-                    elapsed = time.time() - start_time
-
-                    result = response["result"].strip()
-                    sources = response["source_documents"]
-
-                    # Format response with sources
-                    source_info = "\n\n**📚 Sources:**\n"
-                    for i, doc in enumerate(sources[:2], 1):
-                        page = doc.metadata.get('page', 'N/A')
-                        source = os.path.basename(doc.metadata.get('source', 'Unknown'))
-                        snippet = doc.page_content[:100] + "..."
-                        source_info += f"{i}. **{source} (Page {page})**: {snippet}\n"
-
-                    full_response = f"{result}\n\n{source_info}"
-                    
-                    st.markdown(full_response)
-                    st.caption(f"⏱️ Response time: {elapsed:.1f}s")
-
+                    full = f"{answer}\n\n**Sources:**\n{src_info}"
+                    st.markdown(full)
+                    st.session_state.messages.append({"role": "assistant", "content": full})
                 except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
-                    st.info("""
-                    **Quick Fix:**
-                    1. Terminal: `ollama serve` (keep running)
-                    2. New Terminal: `ollama pull phi3:mini`
-                    3. Refresh page
-                    """)
-
-        # Add to chat history
-        st.session_state.messages.append({
-            'role': 'assistant', 
-            'content': full_response
-        })
+                    st.error(f"Error during QA: {e}")
 
 if __name__ == "__main__":
     main()
